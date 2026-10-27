@@ -68,11 +68,44 @@ function Card({ title, children, style }) {
 function getApiErrorMessage(error) {
   if (error.response?.data?.message) return error.response.data.message;
   if (error.response?.data?.detail) return error.response.data.detail;
+  if (error.response?.data?.issues?.length) {
+    return error.response.data.issues
+      .map((issue) => `${issue.field}: ${issue.message}`)
+      .join('\n');
+  }
   if (error.request) {
     return `Cannot reach the backend at ${API_BASE_URL}. Check that the server is running and the device can reach this address.`;
   }
   return error.message || 'The request failed.';
 }
+
+// ---------------------------------------------------------------------------
+// Shared authenticated helpers (used by Reset screen and elsewhere)
+// ---------------------------------------------------------------------------
+
+async function authHeaders() {
+  const token = await SecureStore.getItemAsync('token');
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
+async function resetAttendance() {
+  return api.post('/api/admin/reset', { scope: 'attendance' }, { headers: await authHeaders() });
+}
+
+async function resetMyFace(employeeId) {
+  if (!employeeId) throw new Error('Missing employee_id for face reset');
+  return api.post(
+    '/api/admin/reset',
+    { scope: 'employee_face', employee_id: String(employeeId) },
+    { headers: await authHeaders() }
+  );
+}
+
+async function resetAllData() {
+  return api.post('/api/admin/reset', { scope: 'all' }, { headers: await authHeaders() });
+}
+
+// ---------------------------------------------------------------------------
 
 function SplashScreen({ navigation }) {
   useEffect(() => {
@@ -148,7 +181,7 @@ function LoginScreen({ setAuthenticatedUser }) {
   );
 }
 
-function DashboardScreen({ user, navigation }) {
+function DashboardScreen({ user, navigation, logout }) {
   const [loading, setLoading] = useState(true);
   const [todayRecord, setTodayRecord] = useState({ check_in: null, check_out: null, working_minutes: 0, status_message: 'No attendance recorded yet.' });
 
@@ -157,8 +190,7 @@ function DashboardScreen({ user, navigation }) {
     setLoading(true);
     const loadToday = async () => {
       try {
-        const token = await SecureStore.getItemAsync('token');
-        const response = await api.get('/api/attendance/today', { headers: { Authorization: `Bearer ${token}` } });
+        const response = await api.get('/api/attendance/today', { headers: await authHeaders() });
         if (active) setTodayRecord(response.data);
       } catch (error) {
         if (active) Alert.alert('Attendance unavailable', getApiErrorMessage(error));
@@ -185,6 +217,13 @@ function DashboardScreen({ user, navigation }) {
       return;
     }
     navigation.navigate('AttendanceCapture', { action });
+  };
+
+  const confirmLogout = () => {
+    Alert.alert('Log out?', 'You will need to sign in again.', [
+      { text: 'Cancel', style: 'cancel' },
+      { text: 'Log out', style: 'destructive', onPress: () => logout?.() },
+    ]);
   };
 
   return (
@@ -214,11 +253,148 @@ function DashboardScreen({ user, navigation }) {
         <Pressable style={styles.linkButton} onPress={() => navigation.navigate('History')}><Text style={styles.linkButtonText}>Attendance history</Text></Pressable>
         <Pressable style={styles.linkButton} onPress={() => navigation.navigate('Profile')}><Text style={styles.linkButtonText}>Profile</Text></Pressable>
         <Pressable style={styles.linkButton} onPress={() => navigation.navigate('Permissions')}><Text style={styles.linkButtonText}>Permissions and office location</Text></Pressable>
+        <Pressable style={styles.linkButton} onPress={() => navigation.navigate('ResetData')}><Text style={styles.linkButtonText}>Reset captured data</Text></Pressable>
         {user.role === 'admin' ? (
           <Pressable style={styles.linkButton} onPress={() => navigation.navigate('EmployeeRegistration')}>
             <Text style={styles.linkButtonText}>Create employee account</Text>
           </Pressable>
         ) : null}
+        <Pressable style={styles.dangerButton} onPress={confirmLogout}>
+          <Text style={styles.dangerButtonText}>Log out</Text>
+        </Pressable>
+      </ScrollView>
+    </SafeAreaView>
+  );
+}
+
+function ResetDataScreen({ user, logout }) {
+  const [busy, setBusy] = useState(false);
+
+  const confirmAndRun = (title, message, runner) => {
+    if (busy) return;
+    Alert.alert(
+      `Reset ${title}?`,
+      message || 'This cannot be undone.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Reset',
+          style: 'destructive',
+          onPress: async () => {
+            setBusy(true);
+            try {
+              const response = await runner();
+              Alert.alert('Done', response?.data?.message || `${title} was reset.`);
+            } catch (error) {
+              Alert.alert('Reset failed', getApiErrorMessage(error));
+            } finally {
+              setBusy(false);
+            }
+          },
+        },
+      ]
+    );
+  };
+
+  const resetLocalSession = async () => {
+    Alert.alert(
+      'Clear local session?',
+      'You will need to log in again.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Clear',
+          style: 'destructive',
+          onPress: async () => {
+            await clearSession();
+            logout?.();
+          },
+        },
+      ]
+    );
+  };
+
+  return (
+    <SafeAreaView style={styles.screenContainer}>
+      <ScrollView contentContainerStyle={styles.contentSpacer}>
+        <Text style={styles.pageHeading}>Reset captured data</Text>
+        <Text style={styles.subText}>Choose what to clear. Resets are permanent.</Text>
+
+        <Card title="Attendance">
+          <Text style={styles.mutedText}>
+            Deletes all check-in/check-out records and audit logs.
+          </Text>
+          <Pressable
+            style={[styles.primaryButton, busy && styles.disabledButton]}
+            onPress={() =>
+              confirmAndRun(
+                'attendance data',
+                'All attendance records will be deleted.',
+                resetAttendance
+              )
+            }
+            disabled={busy}
+          >
+            <Text style={styles.primaryButtonText}>{busy ? 'Resetting…' : 'Reset attendance data'}</Text>
+          </Pressable>
+        </Card>
+
+        <Card title="My face enrollment">
+          <Text style={styles.mutedText}>
+            Sets your face status to pending so you can re-enroll.
+          </Text>
+          <Pressable
+            style={[styles.secondaryButton, busy && styles.disabledButton]}
+            onPress={() =>
+              confirmAndRun(
+                'my face enrollment',
+                'Your face template will be deleted and you will need to re-enroll.',
+                () => resetMyFace(user.employee_id)
+              )
+            }
+            disabled={busy}
+          >
+            <Text style={styles.secondaryButtonText}>Reset my face enrollment</Text>
+          </Pressable>
+        </Card>
+
+        {user.role === 'admin' ? (
+          <Card title="Everything (admin)">
+            <Text style={styles.mutedText}>
+              Clears all attendance and face templates, then recreates a fresh bootstrap admin.
+            </Text>
+            <Pressable
+              style={[styles.dangerButton, busy && styles.disabledButton]}
+              onPress={() =>
+                confirmAndRun(
+                  'all data',
+                  'All employees, attendance, and face templates will be deleted. A fresh admin account will be created.',
+                  async () => {
+                    const response = await resetAllData();
+                    // If the backend rotates the admin token, update the local session.
+                    if (response?.data?.access_token && response?.data?.employee) {
+                      await saveSession(response.data.access_token, response.data.employee);
+                      logout?.();
+                    }
+                    return response;
+                  }
+                )
+              }
+              disabled={busy}
+            >
+              <Text style={styles.dangerButtonText}>Reset all data</Text>
+            </Pressable>
+          </Card>
+        ) : null}
+
+        <Card title="Local session">
+          <Text style={styles.mutedText}>
+            Clears your saved token on this device. You will need to log in again.
+          </Text>
+          <Pressable style={styles.linkButton} onPress={resetLocalSession}>
+            <Text style={styles.linkButtonText}>Clear local session</Text>
+          </Pressable>
+        </Card>
       </ScrollView>
     </SafeAreaView>
   );
@@ -354,10 +530,11 @@ function FaceEnrollmentScreen({ user }) {
       setRecording(false);
       const photo = await cameraRef.current.takePictureAsync({ quality: 0.7, base64: true });
       if (!photo.base64) throw new Error('Could not capture a face image.');
-      const token = await SecureStore.getItemAsync('token');
-      await api.post('/api/face/enroll', makeLivenessFormData(photo.base64, videoUri, { employee_id: user.employee_id }), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      await api.post(
+        '/api/face/enroll',
+        makeLivenessFormData(photo.base64, videoUri, { employee_id: user.employee_id }),
+        { headers: await authHeaders() }
+      );
       setComplete(true);
       Alert.alert('Enrollment complete', 'The backend provider approved your blink challenge and face enrollment.');
     } catch (error) {
@@ -414,10 +591,11 @@ function FaceVerificationScreen({ route, navigation }) {
       setRecording(false);
       const photo = await cameraRef.current.takePictureAsync({ quality: 0.7, base64: true });
       if (!photo.base64) throw new Error('Could not capture a face image.');
-      const token = await SecureStore.getItemAsync('token');
-      const faceResponse = await api.post('/api/face/verify', makeLivenessFormData(photo.base64, videoUri, { action }), {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const faceResponse = await api.post(
+        '/api/face/verify',
+        makeLivenessFormData(photo.base64, videoUri, { action }),
+        { headers: await authHeaders() }
+      );
       if (!faceResponse.data.recognized || !faceResponse.data.liveness_passed || !faceResponse.data.face_verification_token) {
         throw new Error(faceResponse.data.message || 'Face or blink verification failed.');
       }
@@ -430,7 +608,7 @@ function FaceVerificationScreen({ route, navigation }) {
         face_verification_token: faceResponse.data.face_verification_token,
         idempotency_key: idempotencyKey,
         location: { latitude: location.coords.latitude, longitude: location.coords.longitude, accuracy: location.coords.accuracy },
-      }, { headers: { Authorization: `Bearer ${token}` } });
+      }, { headers: await authHeaders() });
       Alert.alert('Attendance updated', result.data.message || 'Attendance recorded.');
       navigation.goBack();
     } catch (error) {
@@ -465,10 +643,7 @@ function AttendanceHistoryScreen() {
   useEffect(() => {
     const loadHistory = async () => {
       try {
-        const token = await SecureStore.getItemAsync('token');
-        const response = await api.get('/api/attendance/history', {
-          headers: { Authorization: `Bearer ${token}` },
-        });
+        const response = await api.get('/api/attendance/history', { headers: await authHeaders() });
         setRecords(response.data || []);
       } catch (error) {
         setErrorMessage(getApiErrorMessage(error));
@@ -517,10 +692,7 @@ function EmployeeRegistrationScreen() {
     if (saving) return;
     setSaving(true);
     try {
-      const token = await SecureStore.getItemAsync('token');
-      const response = await api.post('/api/auth/register', form, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
+      const response = await api.post('/api/auth/register', form, { headers: await authHeaders() });
       Alert.alert('Employee created', `${response.data.employee.full_name} can now sign in and enroll their face.`);
       setForm({
         employee_id: '',
@@ -645,11 +817,11 @@ function PermissionScreen() {
   );
 }
 
-function AppNavigator({ user }) {
+function AppNavigator({ user, logout }) {
   return (
     <Stack.Navigator initialRouteName="Dashboard" screenOptions={{ headerShown: true }}>
       <Stack.Screen name="Dashboard" options={{ title: 'Dashboard' }}>
-        {(props) => <DashboardScreen {...props} user={user} />}
+        {(props) => <DashboardScreen {...props} user={user} logout={logout} />}
       </Stack.Screen>
       <Stack.Screen name="FaceEnrollment" options={{ title: 'Enrollment' }}>
         {(props) => <FaceEnrollmentScreen {...props} user={user} />}
@@ -661,6 +833,9 @@ function AppNavigator({ user }) {
         {(props) => <ProfileScreen {...props} user={user} />}
       </Stack.Screen>
       <Stack.Screen name="Permissions" options={{ title: 'Permissions' }} component={PermissionScreen} />
+      <Stack.Screen name="ResetData" options={{ title: 'Reset data' }}>
+        {(props) => <ResetDataScreen {...props} user={user} logout={logout} />}
+      </Stack.Screen>
     </Stack.Navigator>
   );
 }
@@ -688,10 +863,10 @@ export default function App() {
     bootstrap();
   }, []);
 
-  const logout = async () => {
+  const logout = useCallback(async () => {
     await clearSession();
     setAuthUser(null);
-  };
+  }, []);
 
   if (loading) {
     return <SplashScreen navigation={{ replace: () => {} }} />;
@@ -798,6 +973,13 @@ const styles = StyleSheet.create({
     flex: 1,
     marginRight: 8,
   },
+  secondaryButton: {
+    backgroundColor: '#0f172a',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginTop: 10,
+  },
   secondaryButtonLarge: {
     backgroundColor: '#0f172a',
     borderRadius: 12,
@@ -805,6 +987,18 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     flex: 1,
     marginLeft: 8,
+  },
+  dangerButton: {
+    backgroundColor: '#b91c1c',
+    borderRadius: 12,
+    paddingVertical: 14,
+    alignItems: 'center',
+    marginTop: 10,
+    marginBottom: 12,
+  },
+  dangerButtonText: {
+    color: '#fff',
+    fontWeight: '700',
   },
   disabledButton: {
     opacity: 0.45,

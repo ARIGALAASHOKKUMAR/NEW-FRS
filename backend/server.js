@@ -8,22 +8,27 @@ import { rateLimit } from 'express-rate-limit';
 import { z } from 'zod';
 import multer from 'multer';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { loadStore, saveStore } from './db.js';
 
 dotenv.config();
 
 const app = express();
-const PORT = Number(process.env.PORT || 5002);
+const PORT = Number(process.env.PORT || 5001);
 const JWT_SECRET = process.env.JWT_SECRET || 'replace-with-your-real-secret-key';
 const JWT_EXPIRES_IN = process.env.JWT_EXPIRES_IN || '7d';
 if (process.env.NODE_ENV === 'production' && (JWT_SECRET === 'replace-with-your-real-secret-key' || JWT_SECRET.length < 32)) {
   throw new Error('Set a unique JWT_SECRET of at least 32 characters before running the backend in production.');
 }
-const FACE_PROVIDER_URL = process.env.FACE_PROVIDER_URL?.replace(/\/+$/, '');
+const USE_LOCAL_FACE_PROVIDER = !process.env.FACE_PROVIDER_URL;
+const FACE_PROVIDER_URL = (process.env.FACE_PROVIDER_URL || 'http://127.0.0.1:8765').replace(/\/+$/, '');
 const FACE_PROVIDER_API_KEY = process.env.FACE_PROVIDER_API_KEY;
 const FACE_ENROLL_PATH = process.env.FACE_ENROLL_PATH || '/enroll';
 const FACE_VERIFY_PATH = process.env.FACE_VERIFY_PATH || '/verify';
-const FACE_MATCH_THRESHOLD = Number(process.env.FACE_MATCH_THRESHOLD || 0.85);
+const FACE_MATCH_THRESHOLD = Number(process.env.FACE_MATCH_THRESHOLD || (USE_LOCAL_FACE_PROVIDER ? 0.363 : 0.85));
 const uploadLivenessVideo = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 12 * 1024 * 1024 },
@@ -31,8 +36,8 @@ const uploadLivenessVideo = multer({
 const usedFaceVerificationTokens = new Set();
 
 const OFFICE = {
-  latitude: Number(process.env.OFFICE_LATITUDE || 13.0068),
-  longitude: Number(process.env.OFFICE_LONGITUDE || 77.5711),
+  latitude: Number(process.env.OFFICE_LATITUDE || 16.422708),
+  longitude: Number(process.env.OFFICE_LONGITUDE || 80.560739),
   radiusMeters: Number(process.env.OFFICE_RADIUS_METERS || 100),
   timezone: process.env.TIMEZONE || 'Asia/Kolkata',
 };
@@ -75,6 +80,10 @@ const attendanceSchema = z.object({
     accuracy: z.number().finite().min(0),
   }).strict(),
 }).strict();
+const resetSchema = z.object({
+  scope: z.enum(['attendance', 'employee_face', 'all']),
+  employee_id: z.union([z.string(), z.number()]).optional(),
+}).strict();
 
 app.use(helmet());
 app.use(cors({
@@ -87,10 +96,29 @@ app.use(cors({
 }));
 app.use(express.json({ limit: '10mb' }));
 
+// ---------------------------------------------------------------------------
+// Store + migration: guarantee every employee has a string employee_id.
+// ---------------------------------------------------------------------------
 const store = loadStore();
 const employees = store.employees;
 const attendanceRecords = store.attendanceRecords;
 const auditLogs = store.auditLogs;
+
+let storeMigrated = false;
+for (const emp of employees) {
+  if (emp.employee_id == null || String(emp.employee_id).trim() === '') {
+    emp.employee_id = `EMP-LEGACY-${emp.id}`;
+    storeMigrated = true;
+    console.warn(`[migration] employee id=${emp.id} → employee_id=${emp.employee_id}`);
+  } else if (typeof emp.employee_id !== 'string') {
+    const before = emp.employee_id;
+    emp.employee_id = String(emp.employee_id).trim();
+    storeMigrated = true;
+    console.warn(`[migration] employee id=${emp.id} employee_id ${typeof before} → string (${emp.employee_id})`);
+  }
+}
+if (storeMigrated) saveStore(store);
+
 if (store.officeLocation) Object.assign(OFFICE, store.officeLocation);
 const attendanceRules = store.attendanceRules || {
   checkInTime: '10:30',
@@ -100,27 +128,32 @@ const attendanceRules = store.attendanceRules || {
 };
 store.attendanceRules = attendanceRules;
 
-if (!employees.some((employee) => employee.role === 'admin')) {
-  const adminEmail = process.env.ADMIN_EMAIL || (process.env.NODE_ENV === 'production' ? '' : 'admin@attendance.local');
-  const adminPassword = process.env.ADMIN_PASSWORD || (process.env.NODE_ENV === 'production' ? '' : 'admin123');
-  if (!adminEmail || !adminPassword || adminPassword.length < 12 && process.env.NODE_ENV === 'production') {
-    throw new Error('Configure ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters to bootstrap an administrator.');
-  }
-  employees.push({
-    id: employees.reduce((max, employee) => Math.max(max, employee.id), 0) + 1,
-    employee_id: process.env.ADMIN_EMPLOYEE_ID || 'EMP-1001',
+const bootstrapAdminEmail = process.env.ADMIN_EMAIL || (process.env.NODE_ENV === 'production' ? '' : 'admin@attendance.local');
+const bootstrapAdminPassword = process.env.ADMIN_PASSWORD || (process.env.NODE_ENV === 'production' ? '' : 'admin123');
+
+function createBootstrapAdmin(id) {
+  return {
+    id,
+    employee_id: String(process.env.ADMIN_EMPLOYEE_ID || 'EMP-1001'),
     full_name: 'System Administrator',
-    email: adminEmail,
+    email: bootstrapAdminEmail,
     department: 'Operations',
     designation: 'Engineer',
     office_assignment: 'Main Office',
     role: 'admin',
     active: true,
-    passwordHash: bcrypt.hashSync(adminPassword, 12),
+    passwordHash: bcrypt.hashSync(bootstrapAdminPassword, 12),
     face_status: 'pending',
     face_embedding: null,
     created_at: new Date().toISOString(),
-  });
+  };
+}
+
+if (!employees.some((employee) => employee.role === 'admin')) {
+  if (!bootstrapAdminEmail || !bootstrapAdminPassword || (bootstrapAdminPassword.length < 12 && process.env.NODE_ENV === 'production')) {
+    throw new Error('Configure ADMIN_EMAIL and an ADMIN_PASSWORD of at least 12 characters to bootstrap an administrator.');
+  }
+  employees.push(createBootstrapAdmin(employees.reduce((max, employee) => Math.max(max, employee.id), 0) + 1));
   saveStore(store);
 }
 
@@ -179,6 +212,12 @@ function parseImageData(imageBase64 = '') {
   return normalized;
 }
 
+function normalizeEmployeeId(value) {
+  if (value == null) return '';
+  if (typeof value === 'number' && !Number.isFinite(value)) return '';
+  return String(value).trim();
+}
+
 function createFaceVerificationToken(employee, action) {
   const verificationId = crypto.randomUUID();
   const token = jwt.sign(
@@ -196,26 +235,35 @@ function createFaceVerificationToken(employee, action) {
 }
 
 async function callFaceProvider(path, payload) {
-  if (!FACE_PROVIDER_URL) {
-    const error = new Error('Face liveness and recognition service is not configured on the backend');
-    error.statusCode = 503;
+  // Defense-in-depth: always send a trimmed string employee_id.
+  if (payload && 'employee_id' in payload) {
+    payload.employee_id = normalizeEmployeeId(payload.employee_id);
+  }
+  console.log(`[face-provider] POST ${path} employee_id=${JSON.stringify(payload?.employee_id)}`);
+
+  let response;
+  try {
+    response = await fetch(`${FACE_PROVIDER_URL}${path}`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        ...(FACE_PROVIDER_API_KEY ? { 'x-api-key': FACE_PROVIDER_API_KEY } : {}),
+      },
+      body: JSON.stringify(payload),
+      signal: AbortSignal.timeout(90000),
+    });
+  } catch (cause) {
+    const error = new Error(USE_LOCAL_FACE_PROVIDER
+      ? 'The local face service is unavailable. Check the backend terminal for model setup errors.'
+      : cause.message);
+    error.statusCode = USE_LOCAL_FACE_PROVIDER ? 503 : 502;
     throw error;
   }
-
-  const response = await fetch(`${FACE_PROVIDER_URL}${path}`, {
-    method: 'POST',
-    headers: {
-      'content-type': 'application/json',
-      ...(FACE_PROVIDER_API_KEY ? { 'x-api-key': FACE_PROVIDER_API_KEY } : {}),
-    },
-    body: JSON.stringify(payload),
-    signal: AbortSignal.timeout(15000),
-  });
   const result = await response.json().catch(() => ({}));
 
   if (!response.ok) {
     const error = new Error(result.message || `Face service returned HTTP ${response.status}`);
-    error.statusCode = 502;
+    error.statusCode = USE_LOCAL_FACE_PROVIDER ? response.status : 502;
     throw error;
   }
   return result;
@@ -281,6 +329,7 @@ app.get('/api/health', (req, res) => {
     service: 'Face Attendance System',
     mode: 'node',
     face_service_configured: Boolean(FACE_PROVIDER_URL),
+    face_service_mode: USE_LOCAL_FACE_PROVIDER ? 'local' : 'external',
   });
 });
 
@@ -334,7 +383,7 @@ app.post('/api/auth/register', authenticate, requireAdmin, (req, res) => {
 
   if (employees.some((employee) =>
     employee.email.toLowerCase() === normalizedEmail.toLowerCase() ||
-    employee.employee_id.toLowerCase() === employeeId.toLowerCase()
+    String(employee.employee_id).toLowerCase() === employeeId.toLowerCase()
   )) {
     return res.status(409).json({ message: 'An employee with that email or employee ID already exists' });
   }
@@ -397,10 +446,16 @@ app.get('/api/employees/me', authenticate, (req, res) => {
 app.post('/api/face/enroll', authenticate, faceRateLimit, uploadLivenessVideo.single('liveness_video'), async (req, res) => {
   const employee = req.employee;
   const body = req.body || {};
-  const target = employees.find((item) => item.employee_id === (body.employee_id || employee.employee_id));
+  const requestedId = normalizeEmployeeId(body.employee_id) || employee.employee_id;
+  const target = employees.find((item) => String(item.employee_id) === requestedId);
 
   if (!target) {
     return res.status(404).json({ message: 'Employee not found' });
+  }
+  if (!normalizeEmployeeId(target.employee_id)) {
+    return res.status(500).json({
+      message: `Employee record id=${target.id} is missing employee_id. Restart the backend to run the migration.`,
+    });
   }
   if (target.id !== employee.id && employee.role !== 'admin') {
     return res.status(403).json({ message: 'You cannot enroll another employee' });
@@ -441,7 +496,15 @@ app.post('/api/face/verify', authenticate, faceRateLimit, uploadLivenessVideo.si
   const body = req.body || {};
   const employee = req.employee;
 
-  if (!employee || !employee.face_embedding) {
+  if (!employee) {
+    return res.status(404).json({ message: 'Employee not found' });
+  }
+  if (!normalizeEmployeeId(employee.employee_id)) {
+    return res.status(500).json({
+      message: `Your account record is missing employee_id (id=${employee.id}). Restart the backend to run the migration.`,
+    });
+  }
+  if (!employee.face_embedding) {
     return res.status(404).json({ message: 'No approved face template found' });
   }
 
@@ -488,6 +551,131 @@ app.post('/api/face/verify', authenticate, faceRateLimit, uploadLivenessVideo.si
     });
   } catch (error) {
     return res.status(error.statusCode || 400).json({ message: error.message || 'Face verification failed' });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Unified reset endpoint used by the React app.
+//   scope: 'attendance'    → clear all attendance + audit logs (admin only)
+//   scope: 'employee_face' → reset caller's own face (or any employee's, if admin)
+//   scope: 'all'           → full wipe (admin only)
+// ---------------------------------------------------------------------------
+app.post('/api/admin/reset', authenticate, faceRateLimit, async (req, res) => {
+  const parsed = resetSchema.safeParse(req.body);
+  if (!parsed.success) {
+    return res.status(400).json({
+      message: 'Invalid reset request',
+      issues: parsed.error.issues.map(({ path, message }) => ({ field: path.join('.'), message })),
+    });
+  }
+  const { scope } = parsed.data;
+  const bodyEmployeeId = normalizeEmployeeId(parsed.data.employee_id);
+
+  if (scope === 'attendance') {
+    if (req.employee.role !== 'admin') {
+      return res.status(403).json({ message: 'Administrator access is required to clear attendance data' });
+    }
+    attendanceRecords.splice(0, attendanceRecords.length);
+    auditLogs.splice(0, auditLogs.length);
+    saveStore(store);
+    writeAuditLog(req.employee, 'attendance.reset_all', 'attendance', 'all');
+    return res.json({ scope, message: 'Attendance records and audit logs cleared' });
+  }
+
+  if (scope === 'employee_face') {
+    const targetEmployeeId = bodyEmployeeId || normalizeEmployeeId(req.employee.employee_id);
+    if (!targetEmployeeId) {
+      return res.status(400).json({ message: 'Employee ID is required for a per-employee face reset' });
+    }
+    const employee = employees.find((item) => String(item.employee_id) === targetEmployeeId);
+    if (!employee) return res.status(404).json({ message: 'Employee not found' });
+    if (employee.id !== req.employee.id && req.employee.role !== 'admin') {
+      return res.status(403).json({ message: 'You cannot reset another employee’s face enrollment' });
+    }
+    try {
+      if (USE_LOCAL_FACE_PROVIDER) {
+        await callFaceProvider('/reset', { scope: 'employee_face', employee_id: employee.employee_id });
+      }
+      employee.face_embedding = null;
+      employee.face_status = 'pending';
+      saveStore(store);
+      writeAuditLog(req.employee, 'face.reset', 'employee', employee.employee_id);
+      return res.json({ scope, employee_id: employee.employee_id, face_status: employee.face_status });
+    } catch (error) {
+      return res.status(error.statusCode || 502).json({ message: error.message || 'Could not reset face enrollment' });
+    }
+  }
+
+  if (scope === 'all') {
+    if (req.employee.role !== 'admin') {
+      return res.status(403).json({ message: 'Administrator access is required for a full reset' });
+    }
+    if (process.env.NODE_ENV === 'production' && (!bootstrapAdminEmail || !bootstrapAdminPassword)) {
+      return res.status(503).json({ message: 'Configure bootstrap administrator credentials before resetting app data' });
+    }
+    try {
+      if (USE_LOCAL_FACE_PROVIDER) {
+        await callFaceProvider('/reset', { scope: 'all' });
+      } else {
+        return res.status(409).json({ message: 'Full reset is unavailable with an external face provider; clear its templates first' });
+      }
+
+      employees.splice(0, employees.length);
+      attendanceRecords.splice(0, attendanceRecords.length);
+      auditLogs.splice(0, auditLogs.length);
+      usedFaceVerificationTokens.clear();
+      const admin = createBootstrapAdmin(1);
+      employees.push(admin);
+      saveStore(store);
+      writeAuditLog(admin, 'app.reset_all', 'system', 'all');
+
+      const { passwordHash, ...publicAdmin } = admin;
+      return res.json({
+        scope,
+        message: 'All employee, face, attendance, and audit data has been cleared. A fresh administrator account is ready.',
+        access_token: generateToken(admin),
+        employee: publicAdmin,
+        admin_email: bootstrapAdminEmail,
+        uses_default_password: !process.env.ADMIN_PASSWORD,
+      });
+    } catch (error) {
+      return res.status(error.statusCode || 502).json({ message: error.message || 'Could not reset app data' });
+    }
+  }
+
+  return res.status(400).json({ message: 'Unknown reset scope' });
+});
+
+// Legacy alias retained for backwards compatibility.
+app.post('/api/admin/reset-all-data', authenticate, requireAdmin, faceRateLimit, async (req, res) => {
+  if (process.env.NODE_ENV === 'production' && (!bootstrapAdminEmail || !bootstrapAdminPassword)) {
+    return res.status(503).json({ message: 'Configure bootstrap administrator credentials before resetting app data' });
+  }
+  try {
+    if (USE_LOCAL_FACE_PROVIDER) {
+      await callFaceProvider('/reset', { scope: 'all' });
+    } else {
+      return res.status(409).json({ message: 'Full reset is unavailable with an external face provider; clear its templates first' });
+    }
+
+    employees.splice(0, employees.length);
+    attendanceRecords.splice(0, attendanceRecords.length);
+    auditLogs.splice(0, auditLogs.length);
+    usedFaceVerificationTokens.clear();
+    const admin = createBootstrapAdmin(1);
+    employees.push(admin);
+    saveStore(store);
+
+    const { passwordHash, ...publicAdmin } = admin;
+    return res.json({
+      message: 'All employee, face, attendance, and audit data has been cleared. A fresh administrator account is ready.',
+      access_token: generateToken(admin),
+      employee: publicAdmin,
+      admin_email: bootstrapAdminEmail,
+      uses_default_password: !process.env.ADMIN_PASSWORD,
+    });
+  } catch (error) {
+    return res.status(error.statusCode || 502).json({ message: error.message || 'Could not reset app data' });
   }
 });
 
@@ -761,7 +949,7 @@ app.get('/api/admin/employees', authenticate, requireAdmin, (req, res) => {
 app.patch('/api/admin/employees/:employeeId/status', authenticate, requireAdmin, (req, res) => {
   const parsed = z.object({ active: z.boolean() }).strict().safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ message: 'active must be true or false' });
-  const employee = employees.find((item) => item.employee_id === req.params.employeeId);
+  const employee = employees.find((item) => String(item.employee_id) === req.params.employeeId);
   if (!employee) return res.status(404).json({ message: 'Employee not found' });
   if (employee.id === req.employee.id && !parsed.data.active) {
     return res.status(400).json({ message: 'You cannot deactivate your own account' });
@@ -772,14 +960,37 @@ app.patch('/api/admin/employees/:employeeId/status', authenticate, requireAdmin,
   return res.json({ employee_id: employee.employee_id, active: employee.active });
 });
 
-app.post('/api/admin/employees/:employeeId/face-reset', authenticate, requireAdmin, (req, res) => {
-  const employee = employees.find((item) => item.employee_id === req.params.employeeId);
+app.post('/api/face/reset', authenticate, faceRateLimit, async (req, res) => {
+  const employee = req.employee;
+  try {
+    if (USE_LOCAL_FACE_PROVIDER) {
+      await callFaceProvider('/reset', { scope: 'employee_face', employee_id: employee.employee_id });
+    }
+    employee.face_embedding = null;
+    employee.face_status = 'pending';
+    saveStore(store);
+    writeAuditLog(employee, 'face.reset', 'employee', employee.employee_id);
+    return res.json({ employee_id: employee.employee_id, face_status: employee.face_status });
+  } catch (error) {
+    return res.status(error.statusCode || 502).json({ message: error.message || 'Could not reset face enrollment' });
+  }
+});
+
+app.post('/api/admin/employees/:employeeId/face-reset', authenticate, requireAdmin, async (req, res) => {
+  const employee = employees.find((item) => String(item.employee_id) === req.params.employeeId);
   if (!employee) return res.status(404).json({ message: 'Employee not found' });
-  employee.face_embedding = null;
-  employee.face_status = 'pending';
-  saveStore(store);
-  writeAuditLog(req.employee, 'face.reset', 'employee', employee.employee_id);
-  return res.json({ employee_id: employee.employee_id, face_status: employee.face_status });
+  try {
+    if (USE_LOCAL_FACE_PROVIDER) {
+      await callFaceProvider('/reset', { scope: 'employee_face', employee_id: employee.employee_id });
+    }
+    employee.face_embedding = null;
+    employee.face_status = 'pending';
+    saveStore(store);
+    writeAuditLog(req.employee, 'face.reset', 'employee', employee.employee_id);
+    return res.json({ employee_id: employee.employee_id, face_status: employee.face_status });
+  } catch (error) {
+    return res.status(error.statusCode || 502).json({ message: error.message || 'Could not reset face enrollment' });
+  }
 });
 
 app.get('/api/admin/attendance', authenticate, requireAdmin, (req, res) => {
@@ -790,7 +1001,7 @@ app.get('/api/admin/attendance', authenticate, requireAdmin, (req, res) => {
   const records = attendanceRecords
     .filter((record) => !from || record.record_date >= String(from))
     .filter((record) => !to || record.record_date <= String(to))
-    .filter((record) => !employeeId || employees.find((employee) => employee.id === record.employee_id)?.employee_id === employeeId)
+    .filter((record) => !employeeId || String(employees.find((employee) => employee.id === record.employee_id)?.employee_id) === String(employeeId))
     .filter((record) => !departmentEmployees || departmentEmployees.has(record.employee_id))
     .sort((a, b) => b.record_date.localeCompare(a.record_date))
     .map((record) => {
@@ -866,6 +1077,26 @@ app.get('/api/admin/audit-logs', authenticate, requireAdmin, (req, res) => {
   const limit = Math.min(500, Math.max(1, Number(req.query.limit) || 100));
   return res.json(auditLogs.slice(-limit).reverse());
 });
+
+let localFaceProviderProcess = null;
+if (USE_LOCAL_FACE_PROVIDER) {
+  const backendDirectory = path.dirname(fileURLToPath(import.meta.url));
+  const pythonExecutable = process.env.PYTHON_EXECUTABLE || (
+    process.platform === 'win32'
+      ? path.join(backendDirectory, '.venv', 'Scripts', 'python.exe')
+      : path.join(backendDirectory, '.venv', 'bin', 'python')
+  );
+  localFaceProviderProcess = spawn(
+    existsSync(pythonExecutable) ? pythonExecutable : 'python3',
+    [path.join(backendDirectory, 'local_face_provider.py')],
+    { cwd: backendDirectory, stdio: 'inherit', env: process.env }
+  );
+  localFaceProviderProcess.on('error', (error) => console.error(`Could not start local face provider: ${error.message}`));
+  localFaceProviderProcess.on('exit', (code) => {
+    if (code !== null && code !== 0) console.error(`Local face provider exited with code ${code}`);
+  });
+  process.on('exit', () => localFaceProviderProcess?.kill());
+}
 
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`FRS backend listening on port ${PORT}`);

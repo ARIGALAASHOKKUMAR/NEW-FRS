@@ -35,6 +35,7 @@ yarn-error.*
 .env
 backend/.env
 backend/data/
+backend/models/
 .venv/
 
 # typescript
